@@ -27,60 +27,57 @@ gemini_api_key = "AIzaSyCbRBKNHM-OEW7HuJ5Kogobeoop6GCzhcY"
 genai.configure(api_key=gemini_api_key)
 
 # Define model path
-embedding_model_path = os.path.join(os.path.dirname(__file__), "models", "all-MiniLM-L6-v2")
-if not os.path.exists(embedding_model_path):
-    embedding_model_path = os.path.join(os.getcwd(), "models", "all-MiniLM-L6-v2")
+embedding_model_path = os.path.join("models", "all-MiniLM-L6-v2")
+os.makedirs(embedding_model_path, exist_ok=True)
 
 # Initialize FastAPI application
 fastapi_app = FastAPI()
 
-# Load embedding model
+# Load embedding model with better error handling
 @st.cache_resource(show_spinner=True)
 def initialize_embedder():
     try:
         from sentence_transformers import SentenceTransformer
-        import os
         model_identifier = "all-MiniLM-L6-v2"
-        local_model_dir = os.path.join("models", model_identifier)
-        os.makedirs(local_model_dir, exist_ok=True)
-        expected_files = ["config.json", "pytorch_model.bin", "sentence_bert_config.json"]
-        files_present = all(os.path.exists(os.path.join(local_model_dir, f)) for f in expected_files)
         
-        if files_present:
+        # Check if model exists locally
+        local_model_files = ["config.json", "pytorch_model.bin", "sentence_bert_config.json"]
+        has_local_model = all(os.path.exists(os.path.join(embedding_model_path, f)) for f in local_model_files)
+        
+        if has_local_model:
             try:
-                embedder = SentenceTransformer(local_model_dir)
+                embedder = SentenceTransformer(embedding_model_path)
                 st.success("Embedder loaded from local storage")
                 return embedder
             except Exception as err:
-                st.warning(f"Local embedder failed: {err}. Trying to download...")
+                st.warning(f"Local model loading failed: {err}")
         
-        if os.getenv('HF_HUB_OFFLINE', '0') == '0':
-            with st.spinner("Fetching embedder (initial setup)..."):
-                try:
-                    embedder = SentenceTransformer(f'sentence-transformers/{model_identifier}')
-                    embedder.save(local_model_dir)
-                    st.success("Embedder fetched and stored")
-                    return embedder
-                except Exception as err:
-                    st.error(f"Failed to fetch model from Hugging Face: {err}. Check your internet connection or pre-download the model to {local_model_dir}.")
-                    st.info("To run offline, download 'sentence-transformers/all-MiniLM-L6-v2' from Hugging Face and place it in 'models/all-MiniLM-L6-v2', then set HF_HUB_OFFLINE=1.")
-                    return None
-        else:
-            st.warning(f"Offline mode enabled but model not found in {local_model_dir}. Running without embeddings.")
+        # Try to download if online
+        try:
+            with st.spinner("Downloading sentence transformer model (first time only)..."):
+                embedder = SentenceTransformer(f'sentence-transformers/{model_identifier}')
+                embedder.save(embedding_model_path)
+                st.success("Model downloaded and saved locally")
+                return embedder
+        except Exception as download_err:
+            st.error(f"Model download failed: {download_err}")
+            st.info("Please download the model manually from Hugging Face and place in 'models/all-MiniLM-L6-v2'")
+            st.info("Or check your internet connection and try again")
             return None
-    except ImportError as err:
-        st.error(f"Missing dependency: {err}. Install sentence-transformers to use embeddings.")
+            
+    except ImportError as import_err:
+        st.error(f"Required package not found: {import_err}")
         return None
 
 sentence_embedder = initialize_embedder()
+
+# Check if embeddings are available
 try:
-    from sentence_transformers import SentenceTransformer
     import faiss
     embeddings_enabled = sentence_embedder is not None
-except ImportError as err:
-    st.warning(f"Cannot import dependencies: {err}. Operating without embeddings.")
+except ImportError:
+    st.warning("FAISS not available - using basic matching")
     embeddings_enabled = False
-    SentenceTransformer = None
     faiss = None
 
 # Load assessment data
@@ -97,31 +94,36 @@ def fetch_assessment_records():
     except FileNotFoundError:
         st.error("File 'output.csv' not found. Using empty records.")
         return pd.DataFrame(columns=["Assessment Name", "URL", "Remote Testing Support", "Adaptive/IRT Support",
-                                     "Test Type", "Duration", "Job Description", "Job Levels", "Languages", "Scraped Description"])
+                                   "Test Type", "Duration", "Job Description", "Job Levels", "Languages", "Scraped Description"])
     except Exception as err:
         st.error(f"Error reading CSV: {err}")
         return pd.DataFrame(columns=["Assessment Name", "URL", "Remote Testing Support", "Adaptive/IRT Support",
-                                     "Test Type", "Duration", "Job Description", "Job Levels", "Languages", "Scraped Description"])
+                                   "Test Type", "Duration", "Job Description", "Job Levels", "Languages", "Scraped Description"])
 
 assessment_data = fetch_assessment_records()
 
-# Setup FAISS index
+# Setup FAISS index if available
 @st.cache_data
 def configure_vector_store(_records):
     if not embeddings_enabled or sentence_embedder is None:
-        st.warning("Embeddings not available. Running in basic mode.")
+        st.warning("Embeddings not available - using basic text matching")
         return None, [], []
+    
     text_entries = [
         f"{row['Assessment Name']} {row.get('URL', '')} {row['Job Description']} {row['Scraped Description']} "
-        f"{row['Job Levels']} {row['Languages']} {' '.join(row['Assessment Name'].lower().split())}"
+        f"{row['Job Levels']} {row['Languages']}"
         for _, row in _records.iterrows()
     ]
-    vector_data = sentence_embedder.encode(text_entries, show_progress_bar=False)
-    vector_dim = vector_data.shape[1]
-    vector_index = faiss.IndexFlatL2(vector_dim) if faiss else None
-    if vector_index:
+    
+    try:
+        vector_data = sentence_embedder.encode(text_entries, show_progress_bar=False)
+        vector_dim = vector_data.shape[1]
+        vector_index = faiss.IndexFlatL2(vector_dim)
         vector_index.add(vector_data)
-    return vector_index, text_entries, vector_data
+        return vector_index, text_entries, vector_data
+    except Exception as e:
+        st.error(f"Vector store setup failed: {e}")
+        return None, [], []
 
 faiss_index, assessment_texts, assessment_embeddings = configure_vector_store(assessment_data)
 
@@ -149,95 +151,147 @@ async def scrape_url_content(url):
                 response.raise_for_status()
                 html_content = await response.text()
                 soup = BeautifulSoup(html_content, 'html.parser')
-                desc_sections = soup.find_all('div', class_=['description', 'job-details', 'show-more-less-html', 'description__text']) or \
-                                soup.find_all('section', class_=['description'])
+                
+                # Try common description containers
+                desc_selectors = [
+                    'div.description', 
+                    'div.job-details',
+                    'section.description',
+                    'div.show-more-less-html',
+                    'div.description__text'
+                ]
+                
                 content = ""
-                for section in desc_sections:
-                    content += " ".join(p.text.strip() for p in section.find_all('p') if p.text.strip())
-                    content += " ".join(span.text.strip() for span in section.find_all('span') if span.text.strip())
-                    content += " ".join(li.text.strip() for li in section.find_all('li') if li.text.strip())
-                    content += " ".join(script.text.strip() for script in section.find_all('script') if 'description' in script.text.lower())
+                for selector in desc_selectors:
+                    sections = soup.select(selector)
+                    for section in sections:
+                        content += " ".join(element.text.strip() for element in section.find_all(['p', 'span', 'li']))
+                
                 if not content:
-                    content = " ".join(soup.body.get_text(separator=" ").strip().split())
-                return content if content else "No content found"
+                    content = " ".join(soup.get_text(separator=" ").split())
+                
+                return content[:5000] if content else "No content found"
     except Exception as err:
-        return f"URL scrape error {url}: {err}"
+        return f"Could not scrape URL: {err}"
 
 async def find_related_assessments(user_input, limit):
-    if not embeddings_enabled or faiss_index is None or sentence_embedder is None:
-        return [(row, 0) for _, row in assessment_data.iterrows()]
+    if not embeddings_enabled or faiss_index is None:
+        # Basic text matching fallback
+        input_lower = user_input.lower()
+        scores = []
+        for _, row in assessment_data.iterrows():
+            text = f"{row['Assessment Name']} {row['Job Description']}".lower()
+            score = sum(1 for word in input_lower.split() if word in text)
+            scores.append((row, score))
+        
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return [(item, 100-score) for item, score in scores[:limit]]
     
-    loop = asyncio.get_event_loop()
-    input_vector = await loop.run_in_executor(
-        None, 
-        lambda: sentence_embedder.encode([user_input], show_progress_bar=False)
-    )
-    distances, indices = await loop.run_in_executor(
-        None,
-        lambda: faiss_index.search(input_vector, limit)
-    )
-    return [(assessment_data.iloc[i], float(distances[0][j])) 
-            for j, i in enumerate(indices[0]) 
-            if i < len(assessment_data)]
+    try:
+        loop = asyncio.get_event_loop()
+        input_vector = await loop.run_in_executor(
+            None, 
+            lambda: sentence_embedder.encode([user_input], show_progress_bar=False)
+        )
+        
+        distances, indices = await loop.run_in_executor(
+            None,
+            lambda: faiss_index.search(input_vector, limit)
+        )
+        
+        return [(assessment_data.iloc[i], float(distances[0][j])) 
+                for j, i in enumerate(indices[0]) 
+                if i < len(assessment_data)]
+    except Exception as e:
+        st.error(f"Embedding search failed: {e}")
+        return []
 
 def analyze_query_sync(input_text):
     def fetch_gemini_response(text_prompt):
-        config = {
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "top_k": 50,
-            "max_output_tokens": 2048,
-            "response_mime_type": "application/json",
-        }
-        model_instance = genai.GenerativeModel(model_name="models/gemini-2.0-flash", generation_config=config)
-        return model_instance.generate_content(text_prompt)
+        try:
+            model = genai.GenerativeModel('gemini-pro')
+            response = model.generate_content(text_prompt)
+            return response
+        except Exception as e:
+            st.error(f"Gemini API error: {e}")
+            return None
 
     try:
         if input_text.startswith(('http://', 'https://')):
-            input_text = asyncio.run(scrape_url_content(input_text))
-        related_items = asyncio.run(find_related_assessments(input_text, 5))
-        context_info = "\n".join([
-            f"Assessment: {item['Assessment Name']}, Type: {item['Test Type']}, Duration: {item['Duration']}, "
-            f"Job Description: {item['Job Description']}, Job Levels: {item['Job Levels']}, Languages: {item['Languages']}"
-            for item, _ in related_items
-        ])
-        analysis_prompt = f"""
-        Analyze as a job assessment expert. Extract from the query and context:
-        - Skills needed (e.g., Java, Python, SQL, .NET Framework, explicit or inferred).
-        - Time limit in minutes (e.g., '1 hour' → 60, null if unclear).
-        - Test categories: ['Ability & Aptitude', 'Assessment Exercises', 'Biodata & Situational Judgement',
-          'Competencies', 'Development & 360', 'Knowledge & Skills', 'Personality & Behavior', 'Simulations'].
-        - Job tiers (e.g., 'Graduate', 'Mid-Professional', inferred or explicit).
-        - Preferred languages (e.g., 'English (USA)', inferred or explicit).
-        Return JSON with 'skills_needed', 'time_limit', 'test_categories', 'job_tiers', 'preferred_langs'.
-        Defaults: skills_needed: [], time_limit: null, test_categories: [], job_tiers: [], preferred_langs: ['English (USA)'].
-        Query: {input_text}
-        Context: {context_info}
+            scraped_content = asyncio.run(scrape_url_content(input_text))
+            input_text = f"URL Content: {scraped_content}\nOriginal URL: {input_text}"
+
+        prompt = f"""
+        Analyze this job description and extract key requirements:
+        {input_text}
+        
+        Return JSON with these fields:
+        - skills_needed: List of technical skills mentioned
+        - time_limit: Test duration in minutes if specified, else null
+        - test_categories: List of relevant test categories
+        - job_tiers: List of job levels mentioned
+        - preferred_langs: List of preferred languages
+        
+        Example output:
+        {{
+            "skills_needed": ["Java", "Python"],
+            "time_limit": 60,
+            "test_categories": ["Knowledge & Skills"],
+            "job_tiers": ["Mid-Professional"],
+            "preferred_langs": ["English (USA)"]
+        }}
         """
-        response = fetch_gemini_response(analysis_prompt)
-        parsed_data = json.loads(response.text) if response.text and response.text.strip().startswith("{") else {
-            "skills_needed": [], "time_limit": None, "test_categories": [], "job_tiers": [], "preferred_langs": ["English (USA)"]
+        
+        response = fetch_gemini_response(prompt)
+        if response and response.text:
+            try:
+                parsed = json.loads(response.text)
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            parsed = {}
+            
+        # Set defaults
+        result = {
+            "skills_needed": parsed.get("skills_needed", []),
+            "time_limit": parsed.get("time_limit"),
+            "test_categories": parsed.get("test_categories", []),
+            "job_tiers": parsed.get("job_tiers", []),
+            "preferred_langs": parsed.get("preferred_langs", ["English (USA)"])
         }
-        if not parsed_data.get("skills_needed"):
-            parsed_data["skills_needed"] = [s for s in ["java", "python", "sql", ".net framework"] if s in input_text.lower()]
-        if not parsed_data.get("test_categories"):
-            parsed_data["test_categories"] = ["Knowledge & Skills"] if any(s in input_text.lower() for s in ["java", "python", "sql", ".net"]) else []
-        if not parsed_data.get("time_limit") and "minutes" in input_text.lower():
-            match = re.search(r"(\d+)\s*minutes?", input_text.lower())
-            parsed_data["time_limit"] = int(match.group(1)) if match else None
-        if not parsed_data.get("job_tiers"):
-            parsed_data["job_tiers"] = ["Mid-Professional"] if "experienced" in input_text.lower() else []
-        if not parsed_data.get("preferred_langs"):
-            parsed_data["preferred_langs"] = ["English (USA)"]
-        return JobRequirements(
-            skills_needed=parsed_data["skills_needed"],
-            time_limit=parsed_data["time_limit"],
-            test_categories=parsed_data["test_categories"],
-            job_tiers=parsed_data["job_tiers"],
-            preferred_langs=parsed_data["preferred_langs"]
-        )
+        
+        # Fallback keyword matching
+        input_lower = input_text.lower()
+        if not result["skills_needed"]:
+            tech_keywords = ["java", "python", "sql", ".net", "c#", "javascript"]
+            result["skills_needed"] = [kw for kw in tech_keywords if kw in input_lower]
+            
+        if not result["test_categories"]:
+            if any(kw in input_lower for kw in ["knowledge", "skill", "technical"]):
+                result["test_categories"] = ["Knowledge & Skills"]
+            elif any(kw in input_lower for kw in ["aptitude", "ability"]):
+                result["test_categories"] = ["Ability & Aptitude"]
+                
+        if not result["job_tiers"]:
+            if "senior" in input_lower:
+                result["job_tiers"] = ["Senior Professional"]
+            elif "entry" in input_lower or "graduate" in input_lower:
+                result["job_tiers"] = ["Graduate"]
+            else:
+                result["job_tiers"] = ["Mid-Professional"]
+                
+        # Extract time if not set
+        if not result["time_limit"]:
+            time_match = re.search(r"(\d+)\s*(min|minutes?|hr|hours?)", input_lower)
+            if time_match:
+                num = int(time_match.group(1))
+                unit = time_match.group(2)
+                result["time_limit"] = num * 60 if unit.startswith('h') else num
+                
+        return JobRequirements(**result)
+        
     except Exception as err:
-        st.error(f"Query analysis failed: {err}")
+        st.error(f"Analysis error: {err}")
         return JobRequirements([], None, [], [], ["English (USA)"])
 
 async def analyze_query_async(input_text):
@@ -247,159 +301,162 @@ async def analyze_query_async(input_text):
 async def suggest_assessments(user_input, result_count=10):
     job_specs = await analyze_query_async(user_input)
     related_entries = await find_related_assessments(user_input, limit=result_count * 2)
-    suggestions_list = []
+    suggestions = []
 
     for entry, distance in related_entries:
-        entry_name = entry["Assessment Name"].lower()
-        time_duration = entry["Duration"]
-        categories = [c.lower().strip() for c in entry["Test Type"].split(", ")]
-        tiers = [t.lower().strip() for t in str(entry["Job Levels"]).split(", ")] if entry["Job Levels"] else []
-        langs = [l.lower().strip() for l in str(entry["Languages"]).split(", ")] if entry["Languages"] else []
-        desc_text = entry["Job Description"].lower()
-        scraped_text = entry["Scraped Description"].lower()
+        entry_data = {
+            "name": entry["Assessment Name"].lower(),
+            "duration": entry["Duration"],
+            "categories": [c.lower().strip() for c in entry["Test Type"].split(",")],
+            "tiers": [t.lower().strip() for t in str(entry["Job Levels"]).split(",")] if entry["Job Levels"] else [],
+            "langs": [l.lower().strip() for l in str(entry["Languages"]).split(",")] if entry["Languages"] else [],
+            "desc": entry["Job Description"].lower(),
+            "scraped": entry["Scraped Description"].lower()
+        }
 
-        skill_matches = [skill for skill in job_specs.skills_needed if skill in entry_name or skill in desc_text or skill in scraped_text or any(skill in c for c in categories)]
-        match_count = len(skill_matches)
-        primary_score = 1000 if match_count == len(job_specs.skills_needed) and job_specs.skills_needed else match_count * 200
-
-        bonus_score = 0
-        if job_specs.time_limit and time_duration != "N/A" and float(time_duration) <= float(job_specs.time_limit) * 1.2:
-            bonus_score += 50
-        elif not job_specs.time_limit and time_duration != "N/A" and float(time_duration) <= 60:
-            bonus_score += 25
-
-        if job_specs.test_categories and any(cat in categories for cat in job_specs.test_categories):
-            bonus_score += 40
-        elif not job_specs.test_categories and any(c in ["knowledge & skills", "ability & aptitude"] for c in categories):
-            bonus_score += 20
-
-        if job_specs.job_tiers and any(tier in tiers for tier in job_specs.job_tiers):
-            bonus_score += 30
-        elif not job_specs.job_tiers and "mid-professional" in tiers:
-            bonus_score += 10
-
-        if job_specs.preferred_langs and any(lang in langs for lang in job_specs.preferred_langs):
-            bonus_score += 20
-        elif not job_specs.preferred_langs and "english (usa)" in langs:
-            bonus_score += 5
-
-        similarity_value = 0 if not embeddings_enabled else (100 - (distance / np.max(distances) * 50) if distance > 0 else 0)
-        bonus_score += similarity_value * 0.5
-
-        total_value = primary_score + bonus_score
-        if total_value > 0:
-            suggestions_list.append(AssessmentSuggestion(total_value, entry, skill_matches))
-
-    suggestions_list.sort(key=lambda x: x.score, reverse=True)
-    return suggestions_list[:result_count]
+        # Calculate skill matches
+        matched_skills = [
+            skill for skill in job_specs.skills_needed 
+            if (skill.lower() in entry_data["name"] or 
+                skill.lower() in entry_data["desc"] or 
+                skill.lower() in entry_data["scraped"])
+        ]
+        
+        # Base score from skill matches
+        score = len(matched_skills) * 100
+        
+        # Duration bonus
+        if job_specs.time_limit and entry_data["duration"] != "N/A":
+            try:
+                entry_duration = float(entry_data["duration"])
+                if entry_duration <= job_specs.time_limit * 1.2:
+                    score += 50
+            except ValueError:
+                pass
+                
+        # Category bonus
+        if job_specs.test_categories:
+            matched_cats = [
+                cat for cat in job_specs.test_categories 
+                if any(cat.lower() in ecat for ecat in entry_data["categories"])
+            ]
+            score += len(matched_cats) * 30
+            
+        # Job level bonus
+        if job_specs.job_tiers:
+            matched_tiers = [
+                tier for tier in job_specs.job_tiers 
+                if any(tier.lower() in etier for etier in entry_data["tiers"])
+            ]
+            score += len(matched_tiers) * 20
+            
+        # Language bonus
+        if job_specs.preferred_langs:
+            matched_langs = [
+                lang for lang in job_specs.preferred_langs 
+                if any(lang.lower() in elang for elang in entry_data["langs"])
+            ]
+            score += len(matched_langs) * 10
+            
+        # Similarity bonus (if using embeddings)
+        if embeddings_enabled and distance > 0:
+            score += max(0, 100 - distance)
+            
+        if score > 0:
+            suggestions.append(AssessmentSuggestion(score, entry, matched_skills))
+            
+    suggestions.sort(key=lambda x: x.score, reverse=True)
+    return suggestions[:result_count]
 
 # FastAPI endpoint
 @fastapi_app.get("/suggest")
-async def fetch_suggestions(input_text: str, max_items: int = 10):
+async def api_suggest(input_text: str, max_items: int = 10):
     if not input_text:
-        raise HTTPException(status_code=400, detail="Input text is required")
-    suggestion_results = await suggest_assessments(input_text, max_items)
-    return {
-        "suggestions": [
-            {
-                "position": i + 1,
-                "assessment_title": sug.details["Assessment Name"],
-                "link": sug.details["URL"],
-                "duration": float(sug.details["Duration"]) if sug.details["Duration"] != "N/A" else "N/A",
-                "remote_support": sug.details["Remote Testing Support"],
-                "adaptive_support": sug.details["Adaptive/IRT Support"],
-                "category": sug.details["Test Type"],
-                "tiers": sug.details["Job Levels"],
-                "langs": sug.details["Languages"],
-                "description": sug.details["Job Description"],
-                "value": sug.score
-            }
-            for i, sug in enumerate(suggestion_results)
-        ]
-    }
+        raise HTTPException(status_code=400, detail="Input text required")
+    
+    try:
+        suggestions = await suggest_assessments(input_text, max_items)
+        return {
+            "suggestions": [
+                {
+                    "rank": idx + 1,
+                    "name": sug.details["Assessment Name"],
+                    "url": sug.details["URL"],
+                    "score": sug.score,
+                    "matched_skills": sug.matched_skills,
+                    "duration": sug.details["Duration"],
+                    "type": sug.details["Test Type"]
+                }
+                for idx, sug in enumerate(suggestions)
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Streamlit app with new UI
+# Streamlit UI
 def run_streamlit():
-    st.title("Assessment Finder")
-    st.write("Enter a job description or URL to get assessment recommendations.")
-
-    # Input selection
-    entry_mode = st.selectbox("Input Type", ["Text", "URL"], index=1)
-    item_limit = st.slider("Number of Suggestions", 5, 15, 10)
-    user_entry = st.text_area(
-        "Job Details or URL",
-        height=100,
-        placeholder="E.g., 'Need Java, Python, SQL devs with .NET, 40 min' or a URL",
-        value="https://www.linkedin.com/jobs/view/research-engineer-ai-at-shl-4194768899/?originalSubdomain=in" if entry_mode == "URL" else "Hiring Java, Python, and SQL developers with .NET Framework experience, 40 minutes."
-    )
-
-    if st.button("Get Suggestions"):
-        if user_entry:
-            with st.spinner("Generating suggestions..."):
-                # Show parsed requirements
-                st.subheader("Parsed Requirements")
-                needs = asyncio.run(analyze_query_async(user_entry))
-                st.json(needs.__dict__)
-
-                # Show recommendations
-                st.subheader("Recommendations")
-                matches = asyncio.run(suggest_assessments(user_entry, item_limit))
-                if matches:
-                    display_data = [
-                        {
-                            "Rank": i + 1,
-                            "Name": m.details["Assessment Name"],
-                            "URL": f'<a href="{m.details["URL"]}" target="_blank">Link</a>',
-                            "Duration": float(m.details["Duration"]) if m.details["Duration"] != "N/A" else "N/A",
-                            "Test Type": m.details["Test Type"],
-                            "Description": m.details["Job Description"][:100] + "..." if len(m.details["Job Description"]) > 100 else m.details["Job Description"]
-                        }
-                        for i, m in enumerate(matches)
-                    ]
-                    matches_df = pd.DataFrame(display_data)
-                    st.write(matches_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-                else:
-                    st.error("No assessments found. Check your input.")
-        else:
-            st.warning("Please provide an input.")
-
-async def assess_performance():
-    test_cases = [
-        {"input": "Hiring Java, Python, SQL developers with .NET Framework, 40 minutes, Mid-Professional, English (USA)",
-         "expected": [".NET Framework 4.5", "Java Programming", "Python Programming", "SQL Server"]},
-        {"input": "Research Engineer AI, 60 minutes, Professional Individual Contributor, English (USA)",
-         "expected": ["AI Skills", "Aeronautical Engineering"]}
-    ]
-    top_n = 5
-    recall_values = []
-    precision_values = []
-
-    for case in test_cases:
-        results = await suggest_assessments(case["input"], top_n)
-        result_titles = [r.details["Assessment Name"] for r in results]
-        expected_set = set(case["expected"])
-        matches_found = len(set(result_titles) & expected_set)
-        total_expected = len(expected_set)
-        recall = matches_found / total_expected if total_expected > 0 else 0
-        recall_values.append(recall)
-        precision_sum = 0
-        relevant_hits = 0
-        for pos, title in enumerate(result_titles[:top_n], 1):
-            if title in expected_set:
-                relevant_hits += 1
-                precision_sum += relevant_hits / pos
-        avg_precision = precision_sum / min(top_n, total_expected) if min(top_n, total_expected) > 0 else 0
-        precision_values.append(avg_precision)
-
-    return np.mean(recall_values) if recall_values else 0, np.mean(precision_values) if precision_values else 0
+    st.title("🔍 Assessment Finder")
+    st.markdown("Find the best assessments for your job requirements")
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        input_text = st.text_area(
+            "Job Description or URL",
+            height=150,
+            placeholder="Paste job description or LinkedIn/Indeed URL",
+            help="For best results, include required skills and job level"
+        )
+    with col2:
+        result_count = st.slider("Results to show", 5, 20, 10)
+        search_btn = st.button("Find Assessments", type="primary")
+    
+    if search_btn and input_text:
+        with st.spinner("Analyzing job requirements..."):
+            try:
+                # Show requirements analysis
+                requirements = asyncio.run(analyze_query_async(input_text))
+                with st.expander("Extracted Requirements", expanded=True):
+                    st.json(requirements.__dict__)
+                
+                # Show results
+                st.subheader("Recommended Assessments")
+                results = asyncio.run(suggest_assessments(input_text, result_count))
+                
+                if not results:
+                    st.warning("No matching assessments found")
+                    return
+                
+                # Display as nice cards
+                for idx, result in enumerate(results, 1):
+                    with st.container():
+                        cols = st.columns([1, 4])
+                        with cols[0]:
+                            st.metric(label="Match Score", value=f"{result.score:.0f}")
+                        with cols[1]:
+                            st.markdown(f"**{result.details['Assessment Name']}**")
+                            st.caption(f"**Type:** {result.details['Test Type']} | "
+                                      f"**Duration:** {result.details['Duration']} | "
+                                      f"**Levels:** {result.details['Job Levels']}")
+                            
+                            if result.matched_skills:
+                                st.write("Matched skills: " + ", ".join(result.matched_skills))
+                            
+                            st.markdown(f"[View Assessment]({result.details['URL']})", unsafe_allow_html=True)
+                        
+                        st.divider()
+                
+            except Exception as e:
+                st.error(f"Error generating suggestions: {e}")
+    elif search_btn:
+        st.warning("Please enter a job description or URL")
 
 def run_fastapi():
     uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
-    # Start FastAPI in a separate process
-    fastapi_process = multiprocessing.Process(target=run_fastapi)
+    # Start FastAPI in background if needed
+    fastapi_process = multiprocessing.Process(target=run_fastapi, daemon=True)
     fastapi_process.start()
     
-    # Run Streamlit in the main process
+    # Run Streamlit
     run_streamlit()
