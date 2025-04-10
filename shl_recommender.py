@@ -15,7 +15,6 @@ from fastapi import FastAPI, HTTPException
 import uvicorn
 import re
 import nest_asyncio
-import multiprocessing
 
 # Set Streamlit page config as the first command
 st.set_page_config(page_title="Assessment Finder", layout="wide")
@@ -30,43 +29,22 @@ genai.configure(api_key=gemini_api_key)
 embedding_model_path = os.path.join("models", "all-MiniLM-L6-v2")
 os.makedirs(embedding_model_path, exist_ok=True)
 
-# Initialize FastAPI application
+# Initialize FastAPI application (kept for potential API use, but not run in background)
 fastapi_app = FastAPI()
 
-# Load embedding model with better error handling
+# Load embedding model with better error handling and cloud compatibility
 @st.cache_resource(show_spinner=True)
 def initialize_embedder():
     try:
         from sentence_transformers import SentenceTransformer
         model_identifier = "all-MiniLM-L6-v2"
-        
-        # Check if model exists locally
-        local_model_files = ["config.json", "pytorch_model.bin", "sentence_bert_config.json"]
-        has_local_model = all(os.path.exists(os.path.join(embedding_model_path, f)) for f in local_model_files)
-        
-        if has_local_model:
-            try:
-                embedder = SentenceTransformer(embedding_model_path)
-                st.success("Embedder loaded from local storage")
-                return embedder
-            except Exception as err:
-                st.warning(f"Local model loading failed: {err}")
-        
-        # Try to download if online
-        try:
-            with st.spinner("Downloading sentence transformer model (first time only)..."):
-                embedder = SentenceTransformer(f'sentence-transformers/{model_identifier}')
-                embedder.save(embedding_model_path)
-                st.success("Model downloaded and saved locally")
-                return embedder
-        except Exception as download_err:
-            st.error(f"Model download failed: {download_err}")
-            st.info("Please download the model manually from Hugging Face and place in 'models/all-MiniLM-L6-v2'")
-            st.info("Or check your internet connection and try again")
-            return None
-            
-    except ImportError as import_err:
-        st.error(f"Required package not found: {import_err}")
+        with st.spinner("Loading or downloading sentence transformer model..."):
+            embedder = SentenceTransformer(model_identifier)
+            embedder.save(embedding_model_path)  # Save for future runs
+            st.success("Embedder loaded successfully")
+            return embedder
+    except Exception as e:
+        st.error(f"Failed to initialize embedder: {e}")
         return None
 
 sentence_embedder = initialize_embedder()
@@ -368,7 +346,7 @@ async def suggest_assessments(user_input, result_count=10):
     suggestions.sort(key=lambda x: x.score, reverse=True)
     return suggestions[:result_count]
 
-# FastAPI endpoint
+# FastAPI endpoint (kept but not run unless explicitly needed)
 @fastapi_app.get("/suggest")
 async def api_suggest(input_text: str, max_items: int = 10):
     if not input_text:
@@ -450,13 +428,10 @@ def run_streamlit():
     elif search_btn:
         st.warning("Please enter a job description or URL")
 
+# Optional FastAPI runner (not used in Streamlit Cloud by default)
 def run_fastapi():
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8001)  # Changed port to avoid conflict
 
 if __name__ == "__main__":
-    # Start FastAPI in background if needed
-    fastapi_process = multiprocessing.Process(target=run_fastapi, daemon=True)
-    fastapi_process.start()
-    
-    # Run Streamlit
+    # Run Streamlit only (FastAPI not started in background for Streamlit Cloud)
     run_streamlit()
