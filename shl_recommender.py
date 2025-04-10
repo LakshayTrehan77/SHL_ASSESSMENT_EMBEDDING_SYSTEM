@@ -7,14 +7,12 @@ import google.generativeai as genai
 import json
 import requests
 from bs4 import BeautifulSoup
-import numpy as np
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import re
+import nest_asyncio
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
 import uvicorn
-import re
-import nest_asyncio
 
 # Set Streamlit page config as the first command
 st.set_page_config(page_title="Assessment Finder", layout="wide")
@@ -25,38 +23,8 @@ nest_asyncio.apply()
 gemini_api_key = "AIzaSyCbRBKNHM-OEW7HuJ5Kogobeoop6GCzhcY"
 genai.configure(api_key=gemini_api_key)
 
-# Define model path
-embedding_model_path = os.path.join("models", "all-MiniLM-L6-v2")
-os.makedirs(embedding_model_path, exist_ok=True)
-
 # Initialize FastAPI application (kept for potential API use, but not run in background)
 fastapi_app = FastAPI()
-
-# Load embedding model with better error handling and cloud compatibility
-@st.cache_resource(show_spinner=True)
-def initialize_embedder():
-    try:
-        from sentence_transformers import SentenceTransformer
-        model_identifier = "all-MiniLM-L6-v2"
-        with st.spinner("Loading or downloading sentence transformer model..."):
-            embedder = SentenceTransformer(model_identifier)
-            embedder.save(embedding_model_path)  # Save for future runs
-            st.success("Embedder loaded successfully")
-            return embedder
-    except Exception as e:
-        st.error(f"Failed to initialize embedder: {e}")
-        return None
-
-sentence_embedder = initialize_embedder()
-
-# Check if embeddings are available
-try:
-    import faiss
-    embeddings_enabled = sentence_embedder is not None
-except ImportError:
-    st.warning("FAISS not available - using basic matching")
-    embeddings_enabled = False
-    faiss = None
 
 # Load assessment data
 @st.cache_data
@@ -79,31 +47,6 @@ def fetch_assessment_records():
                                    "Test Type", "Duration", "Job Description", "Job Levels", "Languages", "Scraped Description"])
 
 assessment_data = fetch_assessment_records()
-
-# Setup FAISS index if available
-@st.cache_data
-def configure_vector_store(_records):
-    if not embeddings_enabled or sentence_embedder is None:
-        st.warning("Embeddings not available - using basic text matching")
-        return None, [], []
-    
-    text_entries = [
-        f"{row['Assessment Name']} {row.get('URL', '')} {row['Job Description']} {row['Scraped Description']} "
-        f"{row['Job Levels']} {row['Languages']}"
-        for _, row in _records.iterrows()
-    ]
-    
-    try:
-        vector_data = sentence_embedder.encode(text_entries, show_progress_bar=False)
-        vector_dim = vector_data.shape[1]
-        vector_index = faiss.IndexFlatL2(vector_dim)
-        vector_index.add(vector_data)
-        return vector_index, text_entries, vector_data
-    except Exception as e:
-        st.error(f"Vector store setup failed: {e}")
-        return None, [], []
-
-faiss_index, assessment_texts, assessment_embeddings = configure_vector_store(assessment_data)
 
 # Define dataclasses
 @dataclass
@@ -153,36 +96,16 @@ async def scrape_url_content(url):
         return f"Could not scrape URL: {err}"
 
 async def find_related_assessments(user_input, limit):
-    if not embeddings_enabled or faiss_index is None:
-        # Basic text matching fallback
-        input_lower = user_input.lower()
-        scores = []
-        for _, row in assessment_data.iterrows():
-            text = f"{row['Assessment Name']} {row['Job Description']}".lower()
-            score = sum(1 for word in input_lower.split() if word in text)
-            scores.append((row, score))
-        
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return [(item, 100-score) for item, score in scores[:limit]]
+    # Basic text matching
+    input_lower = user_input.lower()
+    scores = []
+    for _, row in assessment_data.iterrows():
+        text = f"{row['Assessment Name']} {row['Job Description']} {row['Scraped Description']} {row['Job Levels']} {row['Languages']}".lower()
+        score = sum(1 for word in input_lower.split() if word in text)
+        scores.append((row, score))
     
-    try:
-        loop = asyncio.get_event_loop()
-        input_vector = await loop.run_in_executor(
-            None, 
-            lambda: sentence_embedder.encode([user_input], show_progress_bar=False)
-        )
-        
-        distances, indices = await loop.run_in_executor(
-            None,
-            lambda: faiss_index.search(input_vector, limit)
-        )
-        
-        return [(assessment_data.iloc[i], float(distances[0][j])) 
-                for j, i in enumerate(indices[0]) 
-                if i < len(assessment_data)]
-    except Exception as e:
-        st.error(f"Embedding search failed: {e}")
-        return []
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return [(item, 100 - score) for item, score in scores[:limit]]
 
 def analyze_query_sync(input_text):
     def fetch_gemini_response(text_prompt):
@@ -336,10 +259,7 @@ async def suggest_assessments(user_input, result_count=10):
             ]
             score += len(matched_langs) * 10
             
-        # Similarity bonus (if using embeddings)
-        if embeddings_enabled and distance > 0:
-            score += max(0, 100 - distance)
-            
+        # No embedding distance since embeddings are removed
         if score > 0:
             suggestions.append(AssessmentSuggestion(score, entry, matched_skills))
             
