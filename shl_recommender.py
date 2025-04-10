@@ -62,13 +62,14 @@ def initialize_embedder():
                     st.success("Embedder fetched and stored")
                     return embedder
                 except Exception as err:
-                    st.error(f"Fetch failed: {err}")
+                    st.error(f"Failed to fetch model from Hugging Face: {err}. Check your internet connection or pre-download the model to {local_model_dir}.")
+                    st.info("To run offline, download 'sentence-transformers/all-MiniLM-L6-v2' from Hugging Face and place it in 'models/all-MiniLM-L6-v2', then set HF_HUB_OFFLINE=1.")
                     return None
         else:
-            st.warning("Offline mode: no embeddings available")
+            st.warning(f"Offline mode enabled but model not found in {local_model_dir}. Running without embeddings.")
             return None
     except ImportError as err:
-        st.error(f"Missing dependency: {err}")
+        st.error(f"Missing dependency: {err}. Install sentence-transformers to use embeddings.")
         return None
 
 sentence_embedder = initialize_embedder()
@@ -108,6 +109,7 @@ assessment_data = fetch_assessment_records()
 @st.cache_data
 def configure_vector_store(_records):
     if not embeddings_enabled or sentence_embedder is None:
+        st.warning("Embeddings not available. Running in basic mode.")
         return None, [], []
     text_entries = [
         f"{row['Assessment Name']} {row.get('URL', '')} {row['Job Description']} {row['Scraped Description']} "
@@ -166,18 +168,14 @@ async def find_related_assessments(user_input, limit):
         return [(row, 0) for _, row in assessment_data.iterrows()]
     
     loop = asyncio.get_event_loop()
-    # Encode the input text
     input_vector = await loop.run_in_executor(
         None, 
         lambda: sentence_embedder.encode([user_input], show_progress_bar=False)
     )
-    
-    # Search the FAISS index
     distances, indices = await loop.run_in_executor(
         None,
         lambda: faiss_index.search(input_vector, limit)
     )
-    
     return [(assessment_data.iloc[i], float(distances[0][j])) 
             for j, i in enumerate(indices[0]) 
             if i < len(assessment_data)]
@@ -285,7 +283,7 @@ async def suggest_assessments(user_input, result_count=10):
         elif not job_specs.preferred_langs and "english (usa)" in langs:
             bonus_score += 5
 
-        similarity_value = 0 if not embeddings_enabled else (100 - (distance / np.max(distance) * 50) if distance > 0 else 0)
+        similarity_value = 0 if not embeddings_enabled else (100 - (distance / np.max(distances) * 50) if distance > 0 else 0)
         bonus_score += similarity_value * 0.5
 
         total_value = primary_score + bonus_score
